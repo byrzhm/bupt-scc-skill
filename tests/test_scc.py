@@ -6,6 +6,7 @@ import io
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -164,6 +165,63 @@ class SkillTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertNotIn("test-billing", result.stdout)
         self.assertIn("COMPLETED", result.stdout)
+
+    def test_local_mode_requires_no_ssh_configuration(self):
+        self.env_file.write_text("BUPT_SCC_MODE=local\nBUPT_SLURM_COMMENT=test-billing\n")
+        self.assertEqual(self.command(slurm, "accounting", "123")[:3], ["sacct", "--jobs", "123"])
+        cmd = self.command(slurm, "submit", "/w/a.sbatch", "--workdir", "/w")
+        self.assertEqual(cmd, ["sbatch", "--parsable", "--comment=test-billing", "--chdir", "/w", "/w/a.sbatch"])
+
+    def test_local_exec_is_literal_and_preserves_exit_status(self):
+        value = "a; $(touch unexpected) ' literal"
+        cmd = self.command(scc, "--mode", "local", "exec", "--", sys.executable, "-c",
+                           "import sys; print(sys.argv[1]); sys.exit(7)", value)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(result.stdout.strip(), value)
+        self.assertEqual(result.returncode, 7)
+
+    def test_local_submit_runs_directly_with_comment(self):
+        self.env_file.write_text("BUPT_SCC_MODE=local\nBUPT_SLURM_COMMENT=test-billing\n")
+        with patch.object(scc.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            self.assertEqual(slurm.main(["submit", "/w/a.sbatch", "--workdir", "/w"]), 0)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[0], "sbatch")
+        self.assertIn("--comment=test-billing", argv)
+        self.assertNotIn("shell", run.call_args.kwargs)
+
+    def test_local_missing_comment_and_mode_mistakes_never_execute(self):
+        configs = [{"BUPT_SCC_MODE": "local"}, {"BUPT_SCC_MODE": "typo", "BUPT_SLURM_COMMENT": "test"}]
+        for config in configs:
+            with self.subTest(config=config), patch.object(scc, "load_config", return_value=config):
+                with patch.object(scc.subprocess, "run") as run, contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        slurm.main(["submit", "/w/a.sbatch", "--workdir", "/w"])
+                    run.assert_not_called()
+
+    def test_local_login_and_transfers_fail_without_side_effects(self):
+        for argv in [("login",), ("upload", "a", "/b"), ("download", "a", "/b")]:
+            with self.subTest(argv=argv):
+                with patch.object(scc.subprocess, "run") as run, contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        scc.main(["--mode", "local", *argv])
+                    run.assert_not_called()
+
+    def test_mode_precedence_and_local_dry_run(self):
+        with patch.dict(scc.os.environ, {"BUPT_SCC_MODE": "local"}):
+            self.assertEqual(self.command(slurm, "accounting", "123")[0], "sacct")
+            self.assertEqual(self.command(slurm, "--mode", "ssh", "accounting", "123")[0], "ssh")
+            with patch.object(scc.subprocess, "run") as run, contextlib.redirect_stdout(io.StringIO()) as out:
+                slurm.main(["--dry-run", "submit", "/w/a.sbatch", "--workdir", "/w"])
+            run.assert_not_called()
+            self.assertTrue(out.getvalue().startswith("sbatch "))
+            self.assertNotIn("test-billing", out.getvalue())
+
+    def test_local_missing_executable_reports_cluster_environment(self):
+        with patch.object(scc.subprocess, "run", side_effect=FileNotFoundError):
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(slurm.main(["--mode", "local", "accounting", "123"]), 127)
+            self.assertIn("PATH", err.getvalue())
+            self.assertNotIn("OpenSSH", err.getvalue())
 
 
 if __name__ == "__main__":

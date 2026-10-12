@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BUPT SCC SSH/file transport and shared literal dotenv configuration."""
+"""BUPT SCC local/SSH execution and shared literal dotenv configuration."""
 
 import argparse
 import os
@@ -11,7 +11,7 @@ import sys
 
 
 ENV_FILE = Path(__file__).resolve().parents[3] / ".env"
-CONFIG_KEYS = ("BUPT_SCC_HOST", "BUPT_SCC_PORT", "BUPT_SCC_USER", "BUPT_SCC_IDENTITY",
+CONFIG_KEYS = ("BUPT_SCC_MODE", "BUPT_SCC_HOST", "BUPT_SCC_PORT", "BUPT_SCC_USER", "BUPT_SCC_IDENTITY",
                "BUPT_SLURM_COMMENT", "BUPT_SLURM_PARTITION")
 
 
@@ -41,18 +41,20 @@ def load_config(path=None):
 
 def remote_path(value):
     if not value.startswith("/") or any(c in value for c in "\x00\r\n"):
-        raise argparse.ArgumentTypeError("需要无换行的远端绝对路径")
+        raise argparse.ArgumentTypeError("需要无换行的集群绝对路径")
     return value
 
 
 def add_connection_options(p, config=None):
     config = {} if config is None else config
+    p.add_argument("--mode", choices=("ssh", "local"), default=config.get("BUPT_SCC_MODE") or "ssh",
+                   help="ssh：远程连接（默认）；local：在当前集群机器直接执行")
     p.add_argument("--host", default=config.get("BUPT_SCC_HOST"), help="SSH 登录节点")
     p.add_argument("--port", default=config.get("BUPT_SCC_PORT"), help="SSH 端口")
     p.add_argument("--user", default=config.get("BUPT_SCC_USER"), help="SSH 用户名")
     p.add_argument("--identity", default=config.get("BUPT_SCC_IDENTITY"), help="已有 SSH 私钥路径")
     p.add_argument("--interactive-auth", action="store_true", help="允许交互认证")
-    p.add_argument("--dry-run", action="store_true", help="仅打印脱敏命令，不连接")
+    p.add_argument("--dry-run", action="store_true", help="仅打印脱敏命令，不执行")
 
 
 def parser(config=None):
@@ -64,12 +66,12 @@ def parser(config=None):
         cmd = sub.add_parser(name, help=desc)
         cmd.add_argument("local", help="本地文件路径")
         cmd.add_argument("remote", type=remote_path, help="远端绝对文件路径")
-    cmd = sub.add_parser("exec", help="按参数执行远端命令；用 -- 分隔")
+    cmd = sub.add_parser("exec", help="按当前模式执行命令；用 -- 分隔")
     cmd.add_argument("argv", nargs=argparse.REMAINDER)
     return p
 
 
-def remote_command(args):
+def command_argv(args):
     if args.action == "login":
         return None
     argv = args.argv
@@ -77,7 +79,13 @@ def remote_command(args):
         argv = argv[1:]
     if not argv:
         raise ValueError("exec 需要远端命令")
-    return shlex.join(argv)
+    return argv
+
+
+def execution_mode(args):
+    if args.mode not in ("ssh", "local"):
+        raise ValueError("BUPT_SCC_MODE 必须为 ssh 或 local")
+    return args.mode
 
 
 def connection_options(args):
@@ -106,9 +114,19 @@ def build_ssh(args, remote):
     return command
 
 
+def build_execution(args, argv):
+    if execution_mode(args) == "local":
+        if argv is None:
+            raise ValueError("local 模式已在当前机器执行，无需 login；请使用 exec 或 Slurm 子命令")
+        return argv
+    return build_ssh(args, shlex.join(argv) if argv is not None else None)
+
+
 def build_command(args):
     if args.action not in ("upload", "download"):
-        return build_ssh(args, remote_command(args))
+        return build_execution(args, command_argv(args))
+    if execution_mode(args) == "local":
+        raise ValueError("local 模式不使用 upload/download；文件已在集群上，请明确源/目标并使用 exec -- cp")
     options = connection_options(args)
     local = str(Path(args.local).expanduser().resolve())
     host = f"[{args.host}]" if ":" in args.host else args.host
@@ -136,7 +154,10 @@ def run_command(args, command, config):
     try:
         result = subprocess.run(command, check=False)
     except FileNotFoundError:
-        print("找不到 SSH/SCP 程序，请安装 OpenSSH 客户端。", file=sys.stderr)
+        if args.mode == "local":
+            print("找不到本地命令；请在集群上检查 PATH 和 Slurm/软件环境。", file=sys.stderr)
+        else:
+            print("找不到 SSH/SCP 程序，请安装 OpenSSH 客户端。", file=sys.stderr)
         return 127
     except KeyboardInterrupt:
         if args.action == "submit":

@@ -1,15 +1,19 @@
 ---
 name: bupt-slurm-skill
-description: 在北邮超算上使用 Slurm 发现资源、编写和提交 sbatch 作业、通过私有 comment 配置计费、跟踪日志与退出状态，以及排查 GPU 或分布式训练任务。适用于 sbatch、srun、排队、作业取消和 nvidia-smi 冒烟检查。
+description: 供 Codex、Claude Code 等 Agent 从本机或经 SSH 在北邮超算上使用 Slurm 发现资源、编写和提交 sbatch 作业、通过私有 comment 配置计费、跟踪日志与退出状态，以及排查 GPU 或分布式训练任务。适用于 sbatch、srun、排队、作业取消和 nvidia-smi 冒烟检查。
 ---
 
 # 北邮 Slurm 作业
 
 ## 连接与计费
 
-依赖同级 [bupt-scc-skill](../bupt-scc-skill/SKILL.md) 的 SSH、文件传输和配置解析脚本，两个技能须一起安装；首先阅读其配置部分。`scripts/slurm.py` 共用仓库根目录 `.env`，也支持 `BUPT_SCC_ENV_FILE` 指定外部配置文件。
+依赖同级 [bupt-scc-skill](../bupt-scc-skill/SKILL.md) 的执行方式选择、文件传输和配置解析脚本，两个技能须一起安装；首先阅读其配置部分。`scripts/slurm.py` 共用仓库根目录 `.env`，也支持 `BUPT_SCC_ENV_FILE` 指定外部配置文件。
 
-**提交必须设置 `BUPT_SLURM_COMMENT`。** 其值由用户提供，只存入本地 `.env` 或进程环境。封装通过 `sbatch --comment=...` 传递，不硬编码到模板、文档或测试中，不用 `--account` 替代。缺失或空白时在连接前报错。可选 `BUPT_SLURM_PARTITION` 提供默认分区，`submit --partition` 可覆盖。
+`BUPT_SCC_MODE=ssh`（默认）从个人电脑连接集群；`BUPT_SCC_MODE=local` 在集群上以当前账号直接执行 `sbatch`、`sacct` 等命令，不需要 SSH 连接字段。命令行 `--mode` 可单次覆盖。两种模式共享相同的计费、作业 ID、错误处理与脱敏规则。不要因本机模式而绕过 Slurm 在登录节点执行计算。
+
+local 模式使用 Agent 进程继承的 PATH 和软件环境。若查询提示找不到 Slurm 命令，应先按集群实际配置初始化模块；不要自动切回 SSH 或安装另一套调度器。
+
+**提交必须设置 `BUPT_SLURM_COMMENT`。** 其值由用户提供，只存入本地 `.env` 或进程环境。封装通过 `sbatch --comment=...` 传递，不硬编码到模板、文档或测试中，不用 `--account` 替代。缺失或空白时在执行前报错。可选 `BUPT_SLURM_PARTITION` 提供默认分区，`submit --partition` 可覆盖。
 
 命令行 comment 优先于作业文件内的指令；模板不应包含真实计费值。不要直接绕过封装提交而漏掉 comment。若任务确需 `salloc` 或独立 `srun` 创建分配，先核实当地规则并从同一配置传递计费信息；作业内的 `srun` 使用已有分配。
 
@@ -36,7 +40,7 @@ python3 ../bupt-scc-skill/scripts/scc.py exec -- scontrol show partition
 
 ## 提交与验证
 
-下面路径仅作示意，先通过 SSH 查出真实绝对路径。为每次运行创建独立目录，上传脚本时避免覆盖正在运行作业的文件。
+下面路径仅作示意，先在选定执行模式下查出集群上的真实绝对路径。为每次运行创建独立目录，准备脚本时避免覆盖正在运行作业的文件。SSH 模式先上传；local 模式直接使用集群上已有脚本路径或复制到运行目录，跳过 upload。
 
 ```bash
 python3 ../bupt-scc-skill/scripts/scc.py upload assets/nvidia-smi.sbatch /remote/run/nvidia-smi.sbatch
@@ -44,7 +48,14 @@ python3 scripts/slurm.py --dry-run submit /remote/run/nvidia-smi.sbatch --workdi
 python3 scripts/slurm.py submit /remote/run/nvidia-smi.sbatch --workdir /remote/run --partition PARTITION
 ```
 
-预览只打印脱敏命令，不连接、不检查远端文件。`submit` 接受远端绝对脚本和工作目录，还支持可选 `--account`、`--qos`。读取 `sbatch --parsable` 返回的作业 ID（可能带 `;集群名`），记录脚本、目录、资源与提交时间，但不持久化真实 comment。
+在集群上可直接运行（路径需替换）：
+
+```bash
+python3 scripts/slurm.py --mode local info
+python3 scripts/slurm.py --mode local --dry-run submit /shared/run/job.sbatch --workdir /shared/run --partition PARTITION
+```
+
+预览只打印脱敏命令，不执行命令、不检查目标文件。`submit` 接受集群上的绝对脚本路径和工作目录，还支持可选 `--account`、`--qos`。读取 `sbatch --parsable` 返回的作业 ID（可能带 `;集群名`），记录脚本、目录、资源与提交时间，但不持久化真实 comment。
 
 若 SSH 中断、返回异常或 ID 不完整，先用名称、时间、工作目录、当前用户队列与记账记录查重。仍不确定就报告不确定性，不重复提交。
 

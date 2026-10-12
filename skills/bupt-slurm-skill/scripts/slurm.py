@@ -5,7 +5,6 @@ import argparse
 import importlib.util
 from pathlib import Path
 import re
-import shlex
 import sys
 
 
@@ -35,7 +34,7 @@ def parser(config=None):
                        ("accounting", "作业及步骤记账"), ("cancel", "取消单个作业")]:
         cmd = sub.add_parser(name, help=desc)
         cmd.add_argument("job_id", type=job_id)
-    cmd = sub.add_parser("submit", help="通过本地配置注入计费 comment 并提交远端脚本")
+    cmd = sub.add_parser("submit", help="通过本地配置注入计费 comment 并提交集群上的脚本")
     cmd.add_argument("script", type=scc.remote_path)
     cmd.add_argument("--workdir", required=True, type=scc.remote_path)
     cmd.add_argument("--partition", default=config.get("BUPT_SLURM_PARTITION"))
@@ -44,15 +43,17 @@ def parser(config=None):
     return p
 
 
-def remote_command(args):
+def command_argv(args):
     if args.action == "info":
-        return 'id -un && sinfo --version && sinfo -o "%P %a %l %D %t"'
+        return ["bash", "-o", "pipefail", "-c",
+                'id -un && sinfo --version && sinfo -o "%P %a %l %D %t"']
     if args.action == "queue":
-        return 'squeue --user="$(id -un)" -o "%.18i %.12P %.30j %.8u %.2t %.10M %.6D %R"'
+        return ["bash", "-o", "pipefail", "-c",
+                'squeue --user="$(id -un)" -o "%.18i %.12P %.30j %.8u %.2t %.10M %.6D %R"']
     if args.action == "job":
-        # scontrol exposes Comment, so remove that field before output leaves SSH.
+        # scontrol exposes Comment; remove its standard output line in both modes.
         program = f"scontrol show job {args.job_id} | sed '/^[[:space:]]*Comment=/d'"
-        return shlex.join(["bash", "-o", "pipefail", "-c", program])
+        return ["bash", "-o", "pipefail", "-c", program]
     if args.action == "accounting":
         argv = ["sacct", "--jobs", args.job_id, "--parsable2",
                 "--format=JobID,JobName,State,ExitCode,Elapsed,AllocCPUS,MaxRSS"]
@@ -68,11 +69,11 @@ def remote_command(args):
             if value:
                 argv.append(f"--{name}={value}")
         argv.append(args.script)
-    return shlex.join(argv)
+    return argv
 
 
 def build_command(args):
-    return scc.build_ssh(args, remote_command(args))
+    return scc.build_execution(args, command_argv(args))
 
 
 def main(argv=None):
